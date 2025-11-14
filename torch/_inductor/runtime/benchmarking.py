@@ -39,28 +39,31 @@ GPU_PRIORITY_LOCK: Lock = Lock()
 
 @contextmanager
 def _lock_gpu(timeout: float = GPU_TIMEOUT, priority: bool = True) -> Generator[None, None, None]:
-    start_t: float = time.time()
-    if priority:
-        GPU_PRIORITY_LOCK.acquire()
-    device: torch.device = torch.device("cuda")
-    flock_name: str = f"{device.type}_{device.index or torch.cuda.current_device()}.lock"
-    flock: FileLock = FileLock(default_cache_dir() + f"/locks/{flock_name}")
-    while True:
-        if (time.time() - start_t) > timeout:
-            raise FileLockTimeoutError(flock, timeout)
+    try:
+        start_t: float = time.time()
+        if priority:
+            GPU_PRIORITY_LOCK.acquire()
+        device: torch.device = torch.device("cuda")
+        flock_name: str = f"{device.type}_{device.index or torch.cuda.current_device()}.lock"
+        flock: FileLock = FileLock(default_cache_dir() + f"/locks/{flock_name}")
+        while True:
+            if (time.time() - start_t) > timeout:
+                raise FileLockTimeoutError(flock, timeout)
 
-        if GPU_PRIORITY_LOCK.locked() and not priority:
-            time.sleep(0.5)
-            continue
+            if GPU_PRIORITY_LOCK.locked() and not priority:
+                time.sleep(0.5)
+                continue
 
-        try:
-            with _acquire_flock_with_timeout(flock, timeout=0.5):
-                yield
-        finally:
-            if priority:
-                GPU_PRIORITY_LOCK.release()
+            try:
+                with _acquire_flock_with_timeout(flock, timeout=0.5):
+                    yield
+            except FileLockTimeoutError:
+                continue
 
-        break
+            break
+    finally:
+        if priority:
+            GPU_PRIORITY_LOCK.release()
 
 def lock_gpu(fn: Callable[P, R]) -> Callable[P, R]:
     @wraps(fn)
