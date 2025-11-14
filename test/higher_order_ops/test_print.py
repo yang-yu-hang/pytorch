@@ -230,5 +230,17 @@ x = add_1, y = add_2);  getitem = None
             self.assertEqual(orig_out, opt_out)
 
 
+class TestHopPrintInductor(TestCase):
+    def test_hop_print_inductor(self):
+        def fn(a, b):
+            torch._higher_order_ops.print("hip hop {x} {y}", x=a, y=b)
+            return torch.sin(a, out=b)
+
+        inp = [torch.randn(3, 3), torch.ones(3, 3)]
+        ref_out = fn(*inp)
+        # Validate the hop print can reduce the graph break in dynamo tracing
+        out = torch.compile(backend="inductor")(fn)(*inp)
+        self.assertEqual(ref_out, out)
+
 if __name__ == "__main__":
     run_tests()
