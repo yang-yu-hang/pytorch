@@ -2,16 +2,22 @@ import functools
 import inspect
 import time
 from collections.abc import Callable
+from contextlib import contextmanager
+from filelock import FileLock
 from functools import cached_property, wraps
 from itertools import chain
 from statistics import median
-from typing import Any, Concatenate, Optional, Union
+from threading import Lock
+from typing import Any, Concatenate, Generator, Optional, Union
 from typing_extensions import ParamSpec, Self, TypeVar
 
 import torch
 import torch.utils._pytree as pytree
 from torch._dynamo.utils import counters, dynamo_timed
 from torch._inductor.config import use_experimental_benchmarker
+from torch._inductor.runtime.runtime_utils import default_cache_dir
+from torch._inductor.runtime.caching import FileLockTimeoutError
+from torch._inductor.runtime.caching.locks import _acquire_flock_with_timeout
 from torch.utils._debug_mode import DebugMode
 
 
@@ -24,7 +30,47 @@ use_experimental_benchmarker = (
 MILLISECONDS_PER_SECOND = 1000
 
 P = ParamSpec("P")
+R = TypeVar("R")
 T = TypeVar("T")
+
+# timeout, in seconds, when attempting to lock the gpu
+GPU_TIMEOUT: float = 60.0 * 60.0
+GPU_PRIORITY_LOCK: Lock = Lock()
+
+@contextmanager
+def _lock_gpu(timeout: float = GPU_TIMEOUT, priority: bool = True) -> Generator[None, None, None]:
+    start_t: float = time.time()
+    if priority:
+        GPU_PRIORITY_LOCK.acquire()
+    device: torch.device = torch.device("cuda")
+    flock_name: str = f"{device.type}_{device.index or torch.cuda.current_device()}.lock"
+    flock: FileLock = FileLock(default_cache_dir() + f"/locks/{flock_name}")
+    while True:
+        if (time.time() - start_t) > timeout:
+            raise FileLockTimeoutError
+
+        if GPU_PRIORITY_LOCK.locked() and not priority:
+            time.sleep(0.5)
+            continue
+
+        try:
+            with _acquire_flock_with_timeout(flock, timeout=0.5):
+                yield
+        finally:
+            if priority:
+                GPU_PRIORITY_LOCK.release()
+
+        break
+
+def lock_gpu(fn: Callable[P, R]) -> Callable[P, R]:
+    @wraps(fn)
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+        from torch._inductor.virtualized import threadlocal
+        if getattr(threadlocal, "__torchinductor_gpu_lock_bypass", False):
+            return fn(*args, **kwargs)
+        with _lock_gpu():
+            return fn(*args, **kwargs)
+    return wrapper
 
 
 def may_distort_benchmarking_result(fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -249,6 +295,7 @@ class TritonBenchmarker(Benchmarker):
             raise NotImplementedError("requires Triton") from e
         return do_bench
 
+    @lock_gpu
     @may_distort_benchmarking_result
     @time_and_count
     # pyrefly: ignore [bad-override]
@@ -319,6 +366,7 @@ class InductorBenchmarker(TritonBenchmarker):  # noqa: docstring_linter
             ]
         )
 
+    @lock_gpu
     @may_distort_benchmarking_result
     @time_and_count
     def benchmark_gpu(  # type: ignore[override]

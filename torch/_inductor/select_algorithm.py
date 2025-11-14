@@ -13,6 +13,7 @@ import os
 import re
 import sys
 import textwrap
+import threading
 import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import as_completed, ThreadPoolExecutor
@@ -73,7 +74,8 @@ from .exc import CUDACompileError
 from .fx_utils import count_flops_fx
 from .ir import ChoiceCaller, PrimitiveInfoType
 from .ops_handler import StoreMode
-from .runtime.benchmarking import benchmarker
+from .runtime.benchmarking import benchmarker, _lock_gpu
+from .runtime.caching import FileLockTimeoutError
 from .runtime.hints import DeviceProperties
 from .runtime.triton_compat import HAS_WARP_SPEC
 from .runtime.triton_heuristics import FixedGrid
@@ -2752,25 +2754,40 @@ class AlgorithmSelectorCache(PersistentCache):
         )
 
         if return_multi_template and (config.max_autotune or config.max_autotune_gemm):
+            this_has_priority: threading.Event = threading.Event()
 
-            def get_timings(hint_override: Optional[int] = None):
+            from torch._inductor.virtualized import threadlocal
+            def get_timings(hint_override: Optional[int] = None, graph=None, debug=None):
+                if graph:
+                    setattr(threadlocal, "__torchinductor_graph", graph)
+                if debug:
+                    setattr(threadlocal, "__torchinductor_debug", debug)
                 filtered_choices = [
                     c
                     for c in choices
                     if not hasattr(c, "hint_override")
                     or c.hint_override == hint_override
                 ]
-                timings = self.do_autotuning(
-                    name,
-                    input_nodes,
-                    layout,
-                    input_gen_fns,
-                    inputs_key,
-                    filtered_choices,
-                    precompile_fn,
-                    hint_override=hint_override,
-                    best_config_future=best_config_future,
-                )
+                while True:
+                    try:
+                        with _lock_gpu(timeout=0.5, priority=this_has_priority.is_set()):
+                            setattr(threadlocal, "__torchinductor_gpu_lock_bypass", True)
+                            timings = self.do_autotuning(
+                                name,
+                                input_nodes,
+                                layout,
+                                input_gen_fns,
+                                inputs_key,
+                                filtered_choices,
+                                precompile_fn,
+                                hint_override=hint_override,
+                                best_config_future=best_config_future,
+                            )
+                            setattr(threadlocal, "__torchinductor_gpu_lock_bypass", False)
+                        break
+                    except FileLockTimeoutError:
+                        # we couldn't acquire the lock in time, we'll try again later
+                        continue
                 min_extern_choice = float("inf")
                 for choice, timing in timings.items():
                     if isinstance(choice, ExternKernelCaller):
@@ -2786,6 +2803,21 @@ class AlgorithmSelectorCache(PersistentCache):
                 }
 
                 return timings
+            
+            executor = ThreadPoolExecutor(max_workers=1)
+            get_timings_future = executor.submit(get_timings, graph=getattr(threadlocal, "__torchinductor_graph"), debug=getattr(threadlocal, "__torchinductor_debug"))
+
+            def async_get_timings(hint_override: Optional[int] = None):
+                try:
+                    # signal that this async (or non-async) get_timings
+                    # call has priority and can skip the queue
+                    this_has_priority.set()
+                    if hint_override:
+                        return get_timings(hint_override)
+                    return get_timings_future.result()
+                finally:
+                    # this get_timings no longer has priority
+                    this_has_priority.clear()
 
             # We take the union of allowed prologue inputs from all choices,
             # and, within benchmark fusion, don't allow prologue fusion for
@@ -2799,7 +2831,7 @@ class AlgorithmSelectorCache(PersistentCache):
                 torch._inductor.ir.MultiTemplateBuffer(
                     layout,
                     input_nodes,
-                    get_timings,
+                    async_get_timings,
                     choices,
                     allowed_prologue_inps,
                 )
